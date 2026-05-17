@@ -1,13 +1,22 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import fitz  # เปลี่ยนมาใช้ PyMuPDF (สุดยอดตัวอ่าน PDF)
+import fitz  # PyMuPDF
+import easyocr
 import re
 import io
 from datetime import datetime
 
 # ==========================================
-# 1. ตั้งค่าฐานข้อมูลและฟังก์ชันที่เกี่ยวข้อง
+# โหลดโมเดล AI ดวงตา (ทำแค่ครั้งเดียวตอนเปิดเว็บ)
+# ==========================================
+@st.cache_resource
+def load_ocr_model():
+    # ใช้แค่ภาษาอังกฤษ ('en') เพราะเราหาแค่เลข S/N กับ ตัวเลข Page Count เพื่อความรวดเร็ว
+    return easyocr.Reader(['en'], gpu=False)
+
+# ==========================================
+# 1. ตั้งค่าฐานข้อมูล
 # ==========================================
 DB_NAME = "printer_management.db"
 
@@ -45,48 +54,61 @@ def seed_data_if_empty():
         save_master_data(pd.DataFrame(initial_data))
 
 # ==========================================
-# 2. ฟังก์ชันอ่าน PDF ด้วย PyMuPDF (สูตรทะลุทะลวง)
+# 2. ฟังก์ชันอ่าน PDF + OCR AI
 # ==========================================
-def extract_from_pdf(pdf_file):
+def extract_from_pdf(pdf_file, reader):
     try:
-        # อ่านไฟล์ PDF แบบ Byte
         file_bytes = pdf_file.read()
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         text = ""
+        is_ocr_used = False
+        
+        # 1. ลองอ่านแบบปกติก่อน (เร็วที่สุด)
         for page in doc:
             text += page.get_text("text") + "\n"
         
-        # 🚨 เช็คด่านแรก: ถ้าข้อความว่างเปล่า แปลว่าเป็นไฟล์สแกน (รูปภาพ)
+        # 2. ถ้าอ่านแล้วว่างเปล่า (เป็นไฟล์สแกน) ให้เรียกใช้ดวงตา OCR!
         if not text.strip():
-            return None, 0, "❌ ข้อผิดพลาด: ไฟล์ PDF นี้เป็น 'รูปภาพจากการสแกน' โปรแกรมไม่สามารถอ่านตัวหนังสือจากรูปภาพได้ครับ (ต้องพิมพ์เลขเอง หรือใช้ไฟล์ PDF จากระบบเว็บเครื่องพริ้นต์)"
+            is_ocr_used = True
+            text = ""
+            for page in doc:
+                # แปลงหน้า PDF เป็นรูปภาพความละเอียดสูง
+                pix = page.get_pixmap(dpi=200)
+                img_data = pix.tobytes("png")
+                # ให้ AI อ่านตัวหนังสือจากรูปภาพ
+                result = reader.readtext(img_data, detail=0)
+                text += " ".join(result) + "\n"
 
-        # 🚨 ด่านสอง: ทำความสะอาดข้อความ ลบช่องว่าง ลูกน้ำ ขีดกลาง ออกให้หมด
-        # จาก "Printed Pages",,"402595" จะกลายเป็น "PRINTEDPAGES402595"
+        # 3. ล้างข้อความให้สะอาด (ลบช่องว่าง, ลูกน้ำ) เพื่อเตรียมหาตัวเลข
         clean_text = re.sub(r'[\s,"\'_:\-\.]', '', text).upper()
         
-        # ค้นหา S/N (RTL ตามด้วยตัวอักษรหรือตัวเลข)
+        # ค้นหา S/N 
         sn_match = re.search(r'(RTL[0-9A-Z]+)', clean_text)
         sn = sn_match.group(1) if sn_match else None
         
-        # ค้นหา Printed Pages (ตัวเลขที่ติดกับคำว่า PRINTEDPAGES)
+        # ค้นหา Printed Pages
         page_match = re.search(r'PRINTEDPAGES(\d+)', clean_text)
         page_count = int(page_match.group(1)) if page_match else 0
         
-        return sn, page_count, text
+        # คืนค่ากลับไป พร้อมบอกว่าใช้ OCR ช่วยไหม
+        return sn, page_count, text, is_ocr_used
     except Exception as e:
-        return None, 0, f"Error: {str(e)}"
+        return None, 0, f"Error: {str(e)}", False
 
 # ==========================================
-# 3. เริ่มสร้าง UI
+# 3. หน้า UI ของเว็บ
 # ==========================================
 st.set_page_config(layout="wide", page_title="ระบบจัดการเครื่องพิมพ์")
 init_db()
 seed_data_if_empty()
 
+# โหลด AI เตรียมไว้
+ocr_reader = load_ocr_model()
+
 tab1, tab2, tab3 = st.tabs(["🖨️ ระบบบันทึกมิเตอร์ (PDF)", "🔍 ค้นหาเครื่องพิมพ์แบบเร็ว", "⚙️ ตั้งค่าฐานข้อมูล (Config)"])
 
 with tab1:
-    st.header("ดึงข้อมูลจากไฟล์ Status Page (PDF)")
+    st.header("ดึงข้อมูลจากไฟล์ Status Page (รองรับไฟล์สแกน 100%)")
     col1, col2 = st.columns([1, 3])
     with col1:
         target_month = st.date_input("📅 เลือกรอบบิล", datetime.now()).strftime("%Y-%m")
@@ -95,20 +117,23 @@ with tab1:
     extracted_data = {} 
 
     if uploaded_files:
-        success_count = 0
-        for file in uploaded_files:
-            sn, p_count, raw_text = extract_from_pdf(file)
+        with st.spinner("⏳ กำลังใช้ AI อ่านเอกสาร (หากเป็นไฟล์สแกนอาจใช้เวลาสักครู่)..."):
+            success_count = 0
+            for file in uploaded_files:
+                sn, p_count, raw_text, used_ocr = extract_from_pdf(file, ocr_reader)
+                
+                if sn and p_count > 0:
+                    extracted_data[sn] = p_count
+                    success_count += 1
+                    if used_ocr:
+                        st.info(f"👁️ อ่านไฟล์ '{file.name}' สำเร็จ! (ใช้ระบบ AI สแกนภาพช่วยอ่าน)")
+                else:
+                    st.error(f"⚠️ อ่านไฟล์ '{file.name}' สำเร็จ แต่หา S/N หรือ Page Count ไม่เจอ")
+                    with st.expander("🔍 คลิกดูข้อความดิบที่ AI อ่านได้"):
+                        st.text(raw_text)
             
-            if sn and p_count > 0:
-                extracted_data[sn] = p_count
-                success_count += 1
-            else:
-                st.error(f"⚠️ อ่านไฟล์ '{file.name}' สำเร็จ แต่หา S/N หรือ Page Count ไม่เจอ")
-                with st.expander("🔍 คลิกดูข้อความดิบ (สาเหตุ)"):
-                    st.text(raw_text) # โชว์ข้อความชัดๆ ว่าทำไมหาไม่เจอ
-        
-        if success_count > 0:
-            st.success(f"✅ ดึงข้อมูลสำเร็จ {success_count} ไฟล์! (ระบบกรอกลงตารางให้แล้ว)")
+            if success_count > 0:
+                st.success(f"✅ ดึงข้อมูลสำเร็จรวม {success_count} ไฟล์! (ระบบกรอกลงตารางให้แล้ว)")
 
     df = load_master_data()
     df.rename(columns={'sn': 'S/N', 'dept': 'แผนก'}, inplace=True)
@@ -145,7 +170,7 @@ with tab1:
         edited_df.to_excel(writer, index=False, sheet_name='Usage_Data')
     
     st.download_button(
-        label="📥 Export เป็น Excel (สำหรับเดือนนี้)",
+        label="📥 Export เป็น Excel",
         data=output.getvalue(),
         file_name=f"Report_{target_month}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -153,7 +178,6 @@ with tab1:
 
 with tab2:
     st.header("🔍 ค้นหา S/N หรือ แผนก อย่างรวดเร็ว")
-    st.markdown("พิมพ์คำที่ต้องการค้นหา (รองรับเว้นวรรคเพื่อหาหลายตัว เช่น `1728 1872 ER`)")
     search_query = st.text_input("ช่องค้นหา:", placeholder="ตัวอย่าง: 1728 OR...")
     
     if search_query:
@@ -175,7 +199,7 @@ with tab3:
     df_config = load_master_data()
     edited_config_df = st.data_editor(df_config, num_rows="dynamic", use_container_width=True, hide_index=True)
     
-    if st.button("💾 บันทึกการเปลี่ยนแปลงข้อมูล", type="primary"):
+    if st.button("💾 บันทึกการเปลี่ยนแปลง", type="primary"):
         save_master_data(edited_config_df)
         st.success("บันทึกข้อมูลเรียบร้อยแล้ว!")
         st.rerun()
