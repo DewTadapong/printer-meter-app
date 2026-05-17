@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import pdfplumber
+import fitz  # เปลี่ยนมาใช้ PyMuPDF (สุดยอดตัวอ่าน PDF)
 import re
 import io
 from datetime import datetime
@@ -14,7 +14,6 @@ DB_NAME = "printer_management.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # ตารางหลักเก็บข้อมูลเครื่อง
     c.execute('''CREATE TABLE IF NOT EXISTS master_data (sn TEXT PRIMARY KEY, dept TEXT)''')
     conn.commit()
     conn.close()
@@ -30,7 +29,6 @@ def save_master_data(df):
     df.to_sql('master_data', conn, if_exists='replace', index=False)
     conn.close()
 
-# สร้างข้อมูลเริ่มต้น (ถ้าฐานข้อมูลว่าง)
 def seed_data_if_empty():
     df = load_master_data()
     if df.empty:
@@ -47,43 +45,48 @@ def seed_data_if_empty():
         save_master_data(pd.DataFrame(initial_data))
 
 # ==========================================
-# 2. ฟังก์ชันอ่าน PDF ด้วย pdfplumber
+# 2. ฟังก์ชันอ่าน PDF ด้วย PyMuPDF (สูตรทะลุทะลวง)
 # ==========================================
 def extract_from_pdf(pdf_file):
     try:
+        # อ่านไฟล์ PDF แบบ Byte
+        file_bytes = pdf_file.read()
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
         text = ""
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() + "\n"
+        for page in doc:
+            text += page.get_text("text") + "\n"
         
-        # ค้นหา S/N
-        sn_match = re.search(r'(RTL[0-9A-Z]+)', text, re.IGNORECASE)
-        sn = sn_match.group(1).upper() if sn_match else None
+        # 🚨 เช็คด่านแรก: ถ้าข้อความว่างเปล่า แปลว่าเป็นไฟล์สแกน (รูปภาพ)
+        if not text.strip():
+            return None, 0, "❌ ข้อผิดพลาด: ไฟล์ PDF นี้เป็น 'รูปภาพจากการสแกน' โปรแกรมไม่สามารถอ่านตัวหนังสือจากรูปภาพได้ครับ (ต้องพิมพ์เลขเอง หรือใช้ไฟล์ PDF จากระบบเว็บเครื่องพริ้นต์)"
+
+        # 🚨 ด่านสอง: ทำความสะอาดข้อความ ลบช่องว่าง ลูกน้ำ ขีดกลาง ออกให้หมด
+        # จาก "Printed Pages",,"402595" จะกลายเป็น "PRINTEDPAGES402595"
+        clean_text = re.sub(r'[\s,"\'_:\-\.]', '', text).upper()
         
-        # ค้นหา Printed Pages
-        page_match = re.search(r'Printed\s*Pages\D*?(\d+)', text, re.IGNORECASE)
+        # ค้นหา S/N (RTL ตามด้วยตัวอักษรหรือตัวเลข)
+        sn_match = re.search(r'(RTL[0-9A-Z]+)', clean_text)
+        sn = sn_match.group(1) if sn_match else None
+        
+        # ค้นหา Printed Pages (ตัวเลขที่ติดกับคำว่า PRINTEDPAGES)
+        page_match = re.search(r'PRINTEDPAGES(\d+)', clean_text)
         page_count = int(page_match.group(1)) if page_match else 0
         
         return sn, page_count, text
     except Exception as e:
-        return None, 0, str(e)
+        return None, 0, f"Error: {str(e)}"
 
 # ==========================================
-# 3. เริ่มสร้าง UI ด้วย Streamlit
+# 3. เริ่มสร้าง UI
 # ==========================================
 st.set_page_config(layout="wide", page_title="ระบบจัดการเครื่องพิมพ์")
 init_db()
 seed_data_if_empty()
 
-# ทำเมนูนำทาง (Tabs) ด้านบน
 tab1, tab2, tab3 = st.tabs(["🖨️ ระบบบันทึกมิเตอร์ (PDF)", "🔍 ค้นหาเครื่องพิมพ์แบบเร็ว", "⚙️ ตั้งค่าฐานข้อมูล (Config)"])
 
-# ------------------------------------------
-# TAB 1: ระบบบันทึกมิเตอร์จาก PDF
-# ------------------------------------------
 with tab1:
     st.header("ดึงข้อมูลจากไฟล์ Status Page (PDF)")
-    
     col1, col2 = st.columns([1, 3])
     with col1:
         target_month = st.date_input("📅 เลือกรอบบิล", datetime.now()).strftime("%Y-%m")
@@ -100,14 +103,13 @@ with tab1:
                 extracted_data[sn] = p_count
                 success_count += 1
             else:
-                st.error(f"⚠️ อ่านไฟล์ '{file.name}' สำเร็จ แต่หาข้อมูลไม่เจอ")
-                with st.expander("🔍 คลิกดูข้อความดิบ (ช่วยหาจุดผิด)"):
-                    st.text(raw_text if raw_text else "อ่านข้อความไม่ได้เลย (อาจเป็นไฟล์รูปภาพที่ถูกแปลงเป็น PDF)")
+                st.error(f"⚠️ อ่านไฟล์ '{file.name}' สำเร็จ แต่หา S/N หรือ Page Count ไม่เจอ")
+                with st.expander("🔍 คลิกดูข้อความดิบ (สาเหตุ)"):
+                    st.text(raw_text) # โชว์ข้อความชัดๆ ว่าทำไมหาไม่เจอ
         
         if success_count > 0:
-            st.success(f"✅ ดึงข้อมูลสำเร็จ {success_count} ไฟล์!")
+            st.success(f"✅ ดึงข้อมูลสำเร็จ {success_count} ไฟล์! (ระบบกรอกลงตารางให้แล้ว)")
 
-    # แสดงตาราง
     df = load_master_data()
     df.rename(columns={'sn': 'S/N', 'dept': 'แผนก'}, inplace=True)
     df['เลขมิเตอร์ครั้งก่อน'] = 400000 
@@ -121,7 +123,7 @@ with tab1:
     df['เลขมิเตอร์ปัจจุบัน'] = df.apply(apply_extracted_count, axis=1)
     df['การใช้งาน (แผ่น)'] = 0
 
-    st.markdown("*(คุณสามารถพิมพ์ตัวเลขในตารางเพื่อแก้ไขข้อมูลได้โดยตรง)*")
+    st.markdown("*(พิมพ์ตัวเลขแก้ไขในช่อง 'เลขมิเตอร์ปัจจุบัน' ได้เลย)*")
     edited_df = st.data_editor(
         df,
         column_config={
@@ -149,20 +151,14 @@ with tab1:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# ------------------------------------------
-# TAB 2: ระบบค้นหาเครื่องพิมพ์ (ฟีเจอร์เดิม)
-# ------------------------------------------
 with tab2:
     st.header("🔍 ค้นหา S/N หรือ แผนก อย่างรวดเร็ว")
-    st.markdown("พิมพ์คำที่ต้องการค้นหา (รองรับการหาหลายคำพร้อมกันโดยเว้นวรรค เช่น `1728 1872 ER`)")
-    
+    st.markdown("พิมพ์คำที่ต้องการค้นหา (รองรับเว้นวรรคเพื่อหาหลายตัว เช่น `1728 1872 ER`)")
     search_query = st.text_input("ช่องค้นหา:", placeholder="ตัวอย่าง: 1728 OR...")
     
     if search_query:
         df_search = load_master_data()
         search_terms = search_query.split()
-        
-        # ค้นหาในคอลัมน์ sn หรือ dept
         pattern = '|'.join(search_terms)
         result_df = df_search[
             df_search['sn'].str.contains(pattern, case=False, na=False) |
@@ -170,29 +166,16 @@ with tab2:
         ]
         
         if not result_df.empty:
-            st.success(f"✅ พบข้อมูล {len(result_df)} รายการ")
             st.dataframe(result_df.rename(columns={'sn': 'S/N', 'dept': 'แผนก'}), hide_index=True, use_container_width=True)
         else:
             st.error("❌ ไม่พบข้อมูลในระบบ")
 
-# ------------------------------------------
-# TAB 3: หน้า Config ข้อมูล
-# ------------------------------------------
 with tab3:
     st.header("⚙️ ตั้งค่าฐานข้อมูล S/N และ แผนก")
-    st.markdown("คุณสามารถ **เพิ่ม ลบ หรือแก้ไข** ข้อมูลในตารางนี้ได้โดยตรง เมื่อแก้ไขเสร็จแล้วให้กดปุ่มบันทึกด้านล่าง ข้อมูลจะถูกนำไปใช้ในทุกหน้า")
-    
     df_config = load_master_data()
-    
-    # อนุญาตให้แก้ไข เพิ่มลบแถวได้
-    edited_config_df = st.data_editor(
-        df_config,
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True
-    )
+    edited_config_df = st.data_editor(df_config, num_rows="dynamic", use_container_width=True, hide_index=True)
     
     if st.button("💾 บันทึกการเปลี่ยนแปลงข้อมูล", type="primary"):
         save_master_data(edited_config_df)
-        st.success("บันทึกข้อมูลเรียบร้อยแล้ว! ข้อมูลอัปเดตไปที่ระบบค้นหาและระบบบันทึกมิเตอร์แล้ว")
-        st.rerun() # รีเฟรชหน้าเว็บเพื่อให้ข้อมูลอัปเดต
+        st.success("บันทึกข้อมูลเรียบร้อยแล้ว!")
+        st.rerun()
