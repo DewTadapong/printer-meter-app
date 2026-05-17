@@ -3,3 +3,4 @@ pandas
 openpyxl
 pymupdf
 easyocr
+opencv-python-headless
